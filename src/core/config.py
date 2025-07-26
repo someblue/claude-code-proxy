@@ -4,9 +4,18 @@ import sys
 # Configuration
 class Config:
     def __init__(self):
+        # Check for different API key environment variables
         self.openai_api_key = os.environ.get("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        self.ark_api_key = os.environ.get("ARK_API_KEY")
+        
+        # Use ARK_API_KEY if available and base_url is ARK, otherwise use OPENAI_API_KEY
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if "ark-cn-beijing.bytedance.net" in base_url and self.ark_api_key:
+            self.api_key = self.ark_api_key
+        elif self.openai_api_key:
+            self.api_key = self.openai_api_key
+        else:
+            raise ValueError("No valid API key found. Set either OPENAI_API_KEY or ARK_API_KEY")
         
         # Add Anthropic API key for client validation
         self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -32,10 +41,18 @@ class Config:
         
     def validate_api_key(self):
         """Basic API key validation"""
-        if not self.openai_api_key:
+        if not self.api_key:
+            print("api key validate fail, not set.")
             return False
+        
+        # Skip format validation for ARK API or ByteDance API
+        if "ark-cn-beijing.bytedance.net" in self.openai_base_url or "bytedance.net" in self.openai_base_url:
+            print("api key validate pass!")
+            return True
+            
         # Basic format check for OpenAI API keys
-        if not self.openai_api_key.startswith('sk-'):
+        if not self.api_key.startswith('sk-'):
+            print("api key validate fail!")
             return False
         return True
         

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
@@ -12,6 +13,8 @@ class OpenAIClient:
     def __init__(self, api_key: str, base_url: str, timeout: int = 90, api_version: Optional[str] = None):
         self.api_key = api_key
         self.base_url = base_url
+        self.is_bytedance = "bytedance.net" in base_url or "search.bytedance.net" in base_url
+        self.is_ark = "ark-cn-beijing.bytedance.net" in base_url
         
         # Detect if using Azure and instantiate the appropriate client
         if api_version:
@@ -22,11 +25,22 @@ class OpenAIClient:
                 timeout=timeout
             )
         else:
-            self.client = AsyncOpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                timeout=timeout
-            )
+            # For ByteDance API, add Api-Key to default headers
+            if self.is_bytedance and not self.is_ark:
+                self.client = AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=timeout,
+                    default_headers={
+                        "Api-Key": api_key,
+                    }
+                )
+            else:
+                self.client = AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=timeout
+                )
         self.active_requests: Dict[str, asyncio.Event] = {}
     
     async def create_chat_completion(self, request: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
@@ -38,6 +52,12 @@ class OpenAIClient:
             self.active_requests[request_id] = cancel_event
         
         try:
+            # Add ByteDance specific headers if needed
+            if self.is_bytedance and not self.is_ark:
+                if "extra_headers" not in request:
+                    request["extra_headers"] = {}
+                request["extra_headers"]["X-TT-LOGID"] = str(uuid.uuid4())
+            
             # Create task that can be cancelled
             completion_task = asyncio.create_task(
                 self.client.chat.completions.create(**request)
@@ -102,6 +122,12 @@ class OpenAIClient:
             if "stream_options" not in request:
                 request["stream_options"] = {}
             request["stream_options"]["include_usage"] = True
+            
+            # Add ByteDance specific headers if needed
+            if self.is_bytedance and not self.is_ark:
+                if "extra_headers" not in request:
+                    request["extra_headers"] = {}
+                request["extra_headers"]["X-TT-LOGID"] = str(uuid.uuid4())
             
             # Create the streaming completion
             streaming_completion = await self.client.chat.completions.create(**request)
