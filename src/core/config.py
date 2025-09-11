@@ -39,6 +39,61 @@ class Config:
         self.middle_model = os.environ.get("MIDDLE_MODEL", self.big_model)
         self.small_model = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
         
+        # Multi-API-Key to model mapping
+        self.api_key_model_mapping = self._load_api_key_model_mapping()
+        
+    def _load_api_key_model_mapping(self):
+        """
+        Load API key to model mapping from environment variables.
+        
+        Environment variables format:
+        API_KEY_MODEL_MAPPING_<KEY_ID>_BIG="model-name"
+        API_KEY_MODEL_MAPPING_<KEY_ID>_MIDDLE="model-name"  
+        API_KEY_MODEL_MAPPING_<KEY_ID>_SMALL="model-name"
+        API_KEY_MODEL_MAPPING_<KEY_ID>_API_KEY="actual-api-key"
+        
+        Returns a dict mapping API keys to model configurations.
+        """
+        mapping = {}
+        
+        # Find all mapping configurations
+        for key, value in os.environ.items():
+            if key.startswith("API_KEY_MODEL_MAPPING_") and key.endswith("_API_KEY"):
+                # Extract the key ID
+                key_id = key.replace("API_KEY_MODEL_MAPPING_", "").replace("_API_KEY", "")
+                api_key = value
+                
+                # Get corresponding model configurations
+                big_model = os.environ.get(f"API_KEY_MODEL_MAPPING_{key_id}_BIG", self.big_model)
+                middle_model = os.environ.get(f"API_KEY_MODEL_MAPPING_{key_id}_MIDDLE", big_model)
+                small_model = os.environ.get(f"API_KEY_MODEL_MAPPING_{key_id}_SMALL", self.small_model)
+                
+                # Get ignore temperature setting for this API key
+                ignore_temperature = os.environ.get(f"API_KEY_MODEL_MAPPING_{key_id}_IGNORE_TEMPERATURE", "")
+                
+                mapping[api_key] = {
+                    "big_model": big_model,
+                    "middle_model": middle_model,
+                    "small_model": small_model,
+                    "ignore_temperature": ignore_temperature.lower() in ["true", "1"]
+                }
+        
+        return mapping
+    
+    def get_models_for_api_key(self, api_key):
+        """Get model configuration for a specific API key."""
+        if api_key in self.api_key_model_mapping:
+            return self.api_key_model_mapping[api_key]
+        
+        # Fallback to default models
+        default_ignore_temp = os.environ.get("MODEL_IGNORE_TEMPERATURE", "").lower() in ["true", "1"]
+        return {
+            "big_model": self.big_model,
+            "middle_model": self.middle_model,
+            "small_model": self.small_model,
+            "ignore_temperature": default_ignore_temp
+        }
+        
     def validate_api_key(self):
         """Basic API key validation"""
         if not self.api_key:
@@ -59,11 +114,18 @@ class Config:
     def validate_client_api_key(self, client_api_key):
         """Validate client's Anthropic API key"""
         # If no ANTHROPIC_API_KEY is set in the environment, skip validation
-        if not self.anthropic_api_key:
+        if not self.anthropic_api_key and not self.api_key_model_mapping:
             return True
             
-        # Check if the client's API key matches the expected value
-        return client_api_key == self.anthropic_api_key
+        # Check if the client's API key matches the expected value (legacy single-key mode)
+        if self.anthropic_api_key and client_api_key == self.anthropic_api_key:
+            return True
+            
+        # Check if the client's API key is in the multi-key mapping
+        if client_api_key in self.api_key_model_mapping:
+            return True
+            
+        return False
 
 try:
     config = Config()

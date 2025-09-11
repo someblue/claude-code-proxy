@@ -7,6 +7,7 @@ from typing import Optional
 from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
+from src.core.context import set_current_api_key
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.response_converter import (
@@ -34,8 +35,8 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
     elif authorization and authorization.startswith("Bearer "):
         client_api_key = authorization.replace("Bearer ", "")
     
-    # Skip validation if ANTHROPIC_API_KEY is not set in the environment
-    if not config.anthropic_api_key:
+    # Skip validation if no API keys are configured
+    if not config.anthropic_api_key and not config.api_key_model_mapping:
         return
         
     # Validate the client API key
@@ -45,6 +46,14 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
             status_code=401,
             detail="Invalid API key. Please provide a valid Anthropic API key."
         )
+    
+    # Store the validated API key in the request context
+    if client_api_key:
+        set_current_api_key(client_api_key)
+        # Log API key usage (mask for security)
+        masked_key = f"{client_api_key[:8]}...{client_api_key[-4:]}" if len(client_api_key) > 12 else "****"
+        models_config = config.get_models_for_api_key(client_api_key)
+        logger.info(f"API Key authenticated: {masked_key}, Models: BIG={models_config['big_model']}, MIDDLE={models_config['middle_model']}, SMALL={models_config['small_model']}, IgnoreTemp={models_config['ignore_temperature']}")
 
 @router.post("/v1/messages")
 async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):

@@ -4,6 +4,7 @@ from venv import logger
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 from src.core.config import config
+from src.core.context import get_current_api_key
 import logging
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,17 @@ def convert_claude_to_openai(
         "temperature": claude_request.temperature,
         "stream": claude_request.stream,
     }
+    # Check ignore temperature setting for current API key
+    current_api_key = get_current_api_key()
+    models_config = config.get_models_for_api_key(current_api_key)
+    if models_config.get("ignore_temperature", False):
+        original_temp = openai_request.get("temperature", "None")
+        openai_request.pop("temperature", None)
+        masked_key = "****"
+        if current_api_key:
+            masked_key = f"{current_api_key[:8]}...{current_api_key[-4:]}" if len(current_api_key) > 12 else "****"
+        logger.info(f"Temperature ignored for API {masked_key}: {original_temp} -> None")
+
     logger.debug(
         f"Converted Claude request to OpenAI format: {json.dumps(openai_request, indent=2, ensure_ascii=False)}"
     )
