@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -29,10 +30,14 @@ class Config:
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.max_tokens_limit = int(os.environ.get("MAX_TOKENS_LIMIT", "4096"))
         self.min_tokens_limit = int(os.environ.get("MIN_TOKENS_LIMIT", "100"))
-        
+
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))
+
+        # Streaming mode settings
+        self.default_streaming_mode = self._load_default_streaming_mode()
+        self.model_streaming_modes = self._load_model_streaming_modes()
         
         # Model settings - BIG and SMALL models
         self.big_model = os.environ.get("BIG_MODEL", "gpt-4o")
@@ -77,8 +82,85 @@ class Config:
                     "small_model": small_model,
                     "ignore_temperature": ignore_temperature.lower() in ["true", "1"]
                 }
-        
+
         return mapping
+
+    def _load_default_streaming_mode(self) -> str:
+        mode = os.environ.get("DEFAULT_STREAMING_MODE", "stream").strip().lower()
+        if mode not in {"stream", "buffered"}:
+            print(f"Warning: DEFAULT_STREAMING_MODE='{mode}' is invalid. Falling back to 'stream'.")
+            return "stream"
+        return mode
+
+    def _load_model_streaming_modes(self) -> dict:
+        """Load per-model streaming mode overrides."""
+        overrides = {}
+
+        raw_mapping = os.environ.get("MODEL_STREAMING_MODES")
+        if raw_mapping:
+            try:
+                data = json.loads(raw_mapping)
+                if isinstance(data, dict):
+                    for model_name, mode in data.items():
+                        normalized_mode = str(mode).strip().lower()
+                        if normalized_mode in {"stream", "buffered"}:
+                            overrides[model_name.lower()] = normalized_mode
+                        else:
+                            print(
+                                f"Warning: Streaming mode '{mode}' for model '{model_name}' is invalid. Expected 'stream' or 'buffered'."
+                            )
+                else:
+                    print("Warning: MODEL_STREAMING_MODES must be a JSON object mapping model names to modes.")
+            except json.JSONDecodeError as exc:
+                print(f"Warning: Failed to parse MODEL_STREAMING_MODES as JSON: {exc}")
+
+        prefix = "STREAMING_MODE_"
+        for key, value in os.environ.items():
+            if not key.startswith(prefix):
+                continue
+
+            token = key[len(prefix):]
+            model_name = self._env_token_to_model_name(token)
+            normalized_mode = str(value).strip().lower()
+
+            if normalized_mode not in {"stream", "buffered"}:
+                print(
+                    f"Warning: Streaming mode override '{value}' for env '{key}' is invalid. Expected 'stream' or 'buffered'."
+                )
+                continue
+
+            overrides[model_name.lower()] = normalized_mode
+
+        if overrides:
+            print(
+                f"Streaming mode overrides loaded (default='{self.default_streaming_mode}'): "
+                + ", ".join(f"{model}={mode}" for model, mode in overrides.items())
+            )
+
+        return overrides
+
+    def _env_token_to_model_name(self, token: str) -> str:
+        """Convert STREAMING_MODE_* env token to model name.
+
+        Follows convention: replace double underscores with slashes, single underscores with hyphens.
+        """
+        normalized = token.strip()
+        normalized = normalized.replace("__", "/")
+        normalized = normalized.replace("_", "-")
+        return normalized.lower()
+
+    def get_streaming_mode_for_model(self, model_name: str) -> str:
+        """Return streaming mode ('stream' or 'buffered') for the given model."""
+        if not model_name:
+            return self.default_streaming_mode
+
+        mode = self.model_streaming_modes.get(model_name.lower())
+        if mode:
+            return mode
+
+        # Attempt lookup using sanitized key (hyphen replaced with underscore) for safety
+        sanitized_key = model_name.lower().replace("-", "_")
+        return self.model_streaming_modes.get(sanitized_key, self.default_streaming_mode)
     
     def get_models_for_api_key(self, api_key):
         """Get model configuration for a specific API key."""

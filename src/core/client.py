@@ -6,6 +6,7 @@ from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
+from src.core.logging import logger
 
 class OpenAIClient:
     """Async OpenAI client with cancellation support."""
@@ -92,16 +93,34 @@ class OpenAIClient:
             return completion.model_dump()
         
         except AuthenticationError as e:
-            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.error(self._format_error_message("OpenAI authentication error", detail, log_id))
+            raise self._http_exception_with_logid(401, detail, log_id)
         except RateLimitError as e:
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.warning(self._format_error_message("OpenAI rate limit hit", detail, log_id))
+            raise self._http_exception_with_logid(429, detail, log_id)
         except BadRequestError as e:
-            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.warning(self._format_error_message("OpenAI bad request", detail, log_id))
+            raise self._http_exception_with_logid(400, detail, log_id)
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
-            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            message = self._format_error_message(f"OpenAI API error ({status_code})", detail, log_id)
+            if status_code >= 500:
+                logger.error(message)
+            else:
+                logger.warning(message)
+            raise self._http_exception_with_logid(status_code, detail, log_id)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            detail = f"Unexpected error: {str(e)}"
+            logger.error(detail)
+            raise HTTPException(status_code=500, detail=detail)
         
         finally:
             # Clean up active request tracking
@@ -147,21 +166,62 @@ class OpenAIClient:
             yield "data: [DONE]"
                 
         except AuthenticationError as e:
-            raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.error(self._format_error_message("OpenAI authentication error (stream)", detail, log_id))
+            raise self._http_exception_with_logid(401, detail, log_id)
         except RateLimitError as e:
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.warning(self._format_error_message("OpenAI rate limit hit (stream)", detail, log_id))
+            raise self._http_exception_with_logid(429, detail, log_id)
         except BadRequestError as e:
-            raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            logger.warning(self._format_error_message("OpenAI bad request (stream)", detail, log_id))
+            raise self._http_exception_with_logid(400, detail, log_id)
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
-            raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+            detail = self.classify_openai_error(str(e))
+            log_id = self._extract_tt_logid(e)
+            message = self._format_error_message(f"OpenAI API error (stream, {status_code})", detail, log_id)
+            if status_code >= 500:
+                logger.error(message)
+            else:
+                logger.warning(message)
+            raise self._http_exception_with_logid(status_code, detail, log_id)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+            detail = f"Unexpected streaming error: {str(e)}"
+            logger.error(detail)
+            raise HTTPException(status_code=500, detail=detail)
         
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
+
+    @staticmethod
+    def _extract_tt_logid(error: Exception) -> Optional[str]:
+        response = getattr(error, "response", None)
+        if response is not None:
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                return headers.get("x-tt-logid") or headers.get("X-TT-LOGID")
+        headers = getattr(error, "headers", None)
+        if headers is not None:
+            return headers.get("x-tt-logid") or headers.get("X-TT-LOGID")
+        return None
+
+    @staticmethod
+    def _format_error_message(prefix: str, detail: str, log_id: Optional[str]) -> str:
+        if log_id:
+            return f"{prefix}: {detail} (log_id={log_id})"
+        return f"{prefix}: {detail}"
+
+    @staticmethod
+    def _http_exception_with_logid(status_code: int, detail: str, log_id: Optional[str]) -> HTTPException:
+        headers = {"x-tt-logid": log_id} if log_id else None
+        return HTTPException(status_code=status_code, detail=detail, headers=headers)
 
     def classify_openai_error(self, error_detail: Any) -> str:
         """Provide specific error guidance for common OpenAI API issues."""

@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
@@ -67,12 +69,24 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
         # Convert Claude request to OpenAI format
         openai_request = convert_claude_to_openai(request, model_manager)
+        openai_model = openai_request.get("model", "")
+        streaming_mode = config.get_streaming_mode_for_model(openai_model)
+        effective_stream = bool(request.stream and streaming_mode == "stream")
+
+        if effective_stream:
+            openai_request["stream"] = True
+        else:
+            openai_request.pop("stream", None)
+
+        logger.info(
+            f"Request {request_id}: model={openai_model}, streaming_mode={streaming_mode}, client_stream={request.stream}, effective_stream={effective_stream}"
+        )
 
         # Check if client disconnected before processing
         if await http_request.is_disconnected():
             raise HTTPException(status_code=499, detail="Client disconnected")
 
-        if request.stream:
+        if effective_stream:
             # Streaming response - wrap in error handling
             try:
                 openai_stream = openai_client.create_chat_completion_stream(
@@ -108,9 +122,13 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 }
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
-            # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(
-                openai_request, request_id
+            # Buffered response with retries
+            openai_response = await _gather_openai_response_with_retries(
+                openai_request,
+                openai_model,
+                request_id,
+                http_request,
+                streaming_mode,
             )
             claude_response = convert_openai_to_claude_response(
                 openai_response, request
@@ -125,6 +143,99 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         logger.error(traceback.format_exc())
         error_message = openai_client.classify_openai_error(str(e))
         raise HTTPException(status_code=500, detail=error_message)
+
+
+async def _gather_openai_response_with_retries(
+    openai_request: dict,
+    openai_model: str,
+    request_id: str,
+    http_request: Request,
+    streaming_mode: str,
+):
+    """Fetch full completion with transparent retries and cancellation handling."""
+
+    max_attempts = max(1, config.max_retries + 1)
+    backoff_base = 1.0
+    last_error: Optional[HTTPException] = None
+
+    async def monitor_disconnect(stop_event: asyncio.Event):
+        try:
+            while not stop_event.is_set():
+                if await http_request.is_disconnected():
+                    logger.info(f"Request {request_id}: client disconnected, cancelling upstream call")
+                    openai_client.cancel_request(request_id)
+                    break
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            pass
+
+    for attempt in range(1, max_attempts + 1):
+        if await http_request.is_disconnected():
+            logger.info(f"Request {request_id}: client disconnected before attempt {attempt}")
+            raise HTTPException(status_code=499, detail="Client disconnected")
+
+        if attempt > 1:
+            backoff_seconds = min(backoff_base * (2 ** (attempt - 2)), 8.0)
+            logger.info(
+                f"Request {request_id}: retrying model={openai_model} (mode={streaming_mode}), attempt {attempt}/{max_attempts}, waiting {backoff_seconds:.1f}s"
+            )
+            await asyncio.sleep(backoff_seconds)
+
+        stop_event = asyncio.Event()
+        monitor_task = asyncio.create_task(monitor_disconnect(stop_event))
+
+        try:
+            logger.info(
+                f"Request {request_id}: invoking OpenAI completion (attempt {attempt}/{max_attempts}, mode={streaming_mode}, model={openai_model})"
+            )
+            response = await openai_client.create_chat_completion(
+                openai_request, request_id
+            )
+            logger.info(
+                f"Request {request_id}: OpenAI completion success on attempt {attempt}/{max_attempts}"
+            )
+            return response
+        except HTTPException as exc:
+            last_error = exc
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            log_id = None
+            if exc.headers:
+                log_id = exc.headers.get("x-tt-logid") or exc.headers.get("X-TT-LOGID")
+            suffix = f", log_id={log_id}" if log_id else ""
+            logger.warning(
+                f"Request {request_id}: OpenAI completion failed (status={exc.status_code}, attempt {attempt}/{max_attempts}, detail={detail}{suffix})"
+            )
+
+            if not _should_retry(exc) or attempt == max_attempts:
+                logger.error(
+                    f"Request {request_id}: OpenAI completion giving up (status={exc.status_code}, attempt {attempt}/{max_attempts}, detail={detail}{suffix})"
+                )
+                raise
+        finally:
+            stop_event.set()
+            monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor_task
+
+    if last_error:
+        raise last_error
+    raise HTTPException(status_code=500, detail="Failed to obtain completion")
+
+
+def _should_retry(exc: HTTPException) -> bool:
+    if exc.status_code in {400, 401, 403, 404, 422, 499}:
+        return False
+    if exc.status_code == 429:
+        return True
+    if exc.status_code >= 500:
+        return True
+
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    if detail:
+        lowered = detail.lower()
+        if "timeout" in lowered or "temporarily unavailable" in lowered:
+            return True
+    return False
 
 
 @router.post("/v1/messages/count_tokens")
